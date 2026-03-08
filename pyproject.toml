@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pix-downdetector-monitor"
+version = "1.0.0"
+description = "PIX DownDetector Monitor for O11y — Coleta métricas do Downdetector e envia ao Dynatrace"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["monitoring", "dynatrace", "observability", "pix", "downdetector"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "playwright>=1.44.0",
+    "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "pytest-mock>=3.14.0",
+    "black>=24.4.0",
+    "flake8>=7.0.0",
+    "isort>=5.13.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+downdetector-monitor = "downdetector_monitor.monitor:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ============================================================================
+# Black (formatter)
+# ============================================================================
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+include = '\.pyi?$'
+
+# ============================================================================
+# isort (import sorter)
+# ============================================================================
+[tool.isort]
+profile = "black"
+line_length = 100
+src_paths = ["src", "tests"]
+
+# ============================================================================
+# pytest
+# ============================================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "--cov=src/downdetector_monitor",
+    "--cov-report=term-missing",
+    "--cov-report=xml:coverage.xml",
+    "-v",
+]
+
+# ============================================================================
+# mypy (type checker)
+# ============================================================================
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

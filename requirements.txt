@@ -1,0 +1,16 @@
+# ============================================================================
+# PIX DownDetector Monitor — Runtime Dependencies
+# ============================================================================
+
+# Browser Automation
+playwright==1.44.0
+
+# HTTP Client (Dynatrace API)
+requests==2.32.3
+
+# ============================================================================
+# PIX DownDetector Monitor — Dev / Test Dependencies (also in requirements-dev.txt)
+# ============================================================================
+pytest==8.2.2
+pytest-asyncio==0.23.7
+pytest-cov==5.0.0
