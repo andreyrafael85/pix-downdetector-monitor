@@ -330,4 +330,4 @@ Configure os seguintes **Secrets** no repositório GitHub:
 
 ## 📄 Licença
 
-MIT © YOUR_ORG
+MIT / Apache License 2.0
