@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Downdetector Multi-Service Monitor - Production Ready
+Downdetector Multi-Service Monitor - Production Ready v2.0
 Bright Data Scraping Browser + Dynatrace Metrics Integration
 
-Features:
-- Async service monitoring with parallel processing
-- Robust error handling and retry logic
-- Type hints for better code documentation
-- Comprehensive logging with structured output
-- PEP 8 compliant with performance optimizations
+NEW FEATURES v2.0:
+- Robust pattern matching for text variations
+- Multiple validation strategies
+- Intelligent phrase detection with fuzzy matching
+- Enhanced error reporting
 """
 
 import asyncio
@@ -17,9 +16,9 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 import requests
 from playwright.async_api import Browser, Page, async_playwright
@@ -27,7 +26,6 @@ from playwright.async_api import Browser, Page, async_playwright
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
 # Environment variables with validation
 AUTH = os.getenv('AUTH', 'brd-customer-xxxxxxxxxxxxx:xxxxxxxxxxxxxx')
 DT_URL = os.getenv('DT_URL', 'https://xxxxx.live.dynatrace.com')
@@ -35,12 +33,12 @@ DT_API_TOKEN = os.getenv('DT_API_TOKEN', 'dt0c01.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Constants
 SCREENSHOT_DIR = Path("/tmp/downdetector")
-CAPTCHA_TIMEOUT = 60_000  # 60 seconds
-PAGE_TIMEOUT = 180_000  # 3 minutes
-LOAD_TIMEOUT = 120_000  # 2 minutes
-SELECTOR_TIMEOUT = 60_000  # 1 minute
-HUMAN_SIM_DELAY = 3  # seconds
-SERVICE_DELAY = 5  # seconds between services
+CAPTCHA_TIMEOUT = 60_000
+PAGE_TIMEOUT = 180_000
+LOAD_TIMEOUT = 120_000
+SELECTOR_TIMEOUT = 60_000
+HUMAN_SIM_DELAY = 3
+SERVICE_DELAY = 5
 
 # Logging configuration
 logging.basicConfig(
@@ -52,6 +50,64 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# PATTERN DEFINITIONS
+# ============================================================================
+
+class PhrasePatterns:
+    """
+    Centralized phrase patterns for robust detection.
+    Handles text variations across Downdetector updates.
+    """
+    
+    # Padrões que indicam AUSÊNCIA de problemas (status OK)
+    NO_PROBLEMS_PATTERNS = [
+        # Padrão antigo: "relatos de usuários indicam que não há problemas"
+        r'relatos?\s+de\s+usu[aá]rios?\s+indicam?\s+que\s+n[aã]o\s+h[aá]\s+problemas?',
+        
+        # Padrão novo: "relatórios de usuários indicam nenhum problema"
+        r'relat[oó]rios?\s+de\s+usu[aá]rios?\s+indicam?\s+nenhum\s+problema',
+        
+        # Variações adicionais (case-insensitive via flags)
+        r'n[aã]o\s+h[aá]\s+problemas?\s+atuais?',
+        r'nenhum\s+problema\s+atual',
+        r'sem\s+problemas?\s+no\s+momento',
+        r'tudo\s+funcionando',
+        r'servi[cç]o\s+normal',
+        r'sem\s+incidentes?',
+    ]
+    
+    # Padrões que indicam PRESENÇA de problemas
+    PROBLEMS_PATTERNS = [
+        r'usu[aá]rios?\s+est[aã]o\s+reportando\s+problemas?',
+        r'problemas?\s+sendo\s+reportados?',
+        r'incidente\s+em\s+andamento',
+        r'interrup[cç][aã]o\s+detectada',
+        r'fora\s+do\s+ar',
+        r'indispon[ií]vel',
+    ]
+    
+    @classmethod
+    def compile_patterns(cls) -> Tuple[List[re.Pattern], List[re.Pattern]]:
+        """
+        Compile regex patterns for performance.
+        
+        Returns:
+            Tuple of (no_problems_patterns, problems_patterns)
+        """
+        no_problems = [
+            re.compile(pattern, re.IGNORECASE | re.UNICODE)
+            for pattern in cls.NO_PROBLEMS_PATTERNS
+        ]
+        
+        problems = [
+            re.compile(pattern, re.IGNORECASE | re.UNICODE)
+            for pattern in cls.PROBLEMS_PATTERNS
+        ]
+        
+        return no_problems, problems
+
+
+# ============================================================================
 # DATA MODELS
 # ============================================================================
 
@@ -60,15 +116,35 @@ class ServiceConfig:
     """Configuration for a single service to monitor."""
     name: str
     url: str
-    expected_phrase: str
     percentage_keywords: List[str]
-
+    
+    # Optional: Multiple expected phrases for flexibility
+    expected_phrases: List[str] = field(default_factory=list)
+    
     def __post_init__(self):
         """Validate service configuration."""
         if not self.name or not self.url:
-            raise ValueError(f"Service name and URL are required")
+            raise ValueError("Service name and URL are required")
         if not self.url.startswith(('http://', 'https://')):
             raise ValueError(f"Invalid URL: {self.url}")
+        
+        # Se expected_phrases estiver vazio, criar lista padrão
+        if not self.expected_phrases:
+            self.expected_phrases = [
+                f"relatos de usuários indicam que não há problemas atuais com {self.name}",
+                f"relatórios de usuários indicam nenhum problema atual em {self.name}",
+                f"não há problemas atuais com {self.name}",
+                f"nenhum problema atual em {self.name}",
+            ]
+
+
+@dataclass
+class PhraseDetectionResult:
+    """Result of phrase detection analysis."""
+    has_no_problems: bool  # True = sem problemas, False = com problemas
+    matched_pattern: Optional[str] = None
+    detection_method: str = "unknown"
+    confidence: float = 0.0  # 0.0 to 1.0
 
 
 @dataclass
@@ -79,6 +155,7 @@ class ServiceMetrics:
     percentages: Dict[str, int]
     processing_time: float
     success: bool
+    detection_result: Optional[PhraseDetectionResult] = None
     error: Optional[str] = None
 
 
@@ -90,7 +167,6 @@ SERVICES = [
     ServiceConfig(
         name="pix",
         url="https://downdetector.com.br/fora-do-ar/pix/",
-        expected_phrase="relatos de usuários indicam que não há problemas atuais com pix",
         percentage_keywords=[
             "transferências", "pagamentos", "código qr",
             "Website", "Compras", "Login", "Aplicativo Móvel"
@@ -99,7 +175,6 @@ SERVICES = [
     ServiceConfig(
         name="bradesco",
         url="https://downdetector.com.br/fora-do-ar/bradesco/",
-        expected_phrase="relatos de usuários indicam que não há problemas atuais com bradesco",
         percentage_keywords=[
             "PIX Pessoa Física", "Bradesco Net Empresa",
             "Aplicativo Pessoa Física"
@@ -108,7 +183,6 @@ SERVICES = [
     ServiceConfig(
         name="itau",
         url="https://downdetector.com.br/fora-do-ar/banco-itau/",
-        expected_phrase="relatos de usuários indicam que não há problemas atuais com banco itaú",
         percentage_keywords=[
             "Login no aplicativo móvel", "Operações no internet banking", "PIX"
         ]
@@ -129,12 +203,7 @@ def normalize_slug(keyword: str) -> str:
         
     Returns:
         Normalized slug safe for metric names
-        
-    Example:
-        >>> normalize_slug("PIX Pessoa Física")
-        'pix_pessoa_fisica'
     """
-    # Normalize unicode characters
     replacements = {
         'ã': 'a', 'á': 'a', 'à': 'a', 'â': 'a',
         'é': 'e', 'ê': 'e',
@@ -148,23 +217,15 @@ def normalize_slug(keyword: str) -> str:
     for old, new in replacements.items():
         keyword_lower = keyword_lower.replace(old, new)
     
-    # Replace spaces and remove invalid characters
     slug = keyword_lower.replace(' ', '_')
     slug = re.sub(r'[^a-z0-9_]', '_', slug)
-    
-    # Remove duplicate underscores
     slug = re.sub(r'_+', '_', slug).strip('_')
     
     return slug
 
 
 def validate_environment() -> Tuple[bool, List[str]]:
-    """
-    Validate required environment variables.
-    
-    Returns:
-        Tuple of (is_valid, list_of_errors)
-    """
+    """Validate required environment variables."""
     errors = []
     
     if 'xxxxx' in AUTH:
@@ -182,6 +243,101 @@ def validate_environment() -> Tuple[bool, List[str]]:
     return (len(errors) == 0, errors)
 
 
+def detect_no_problems_phrase(text: str, service_name: str) -> PhraseDetectionResult:
+    """
+    Intelligent phrase detection with multiple strategies.
+    
+    Strategies:
+    1. Compiled regex patterns (primary)
+    2. Exact phrase matching (fallback)
+    3. Fuzzy keyword matching (last resort)
+    
+    Args:
+        text: Page text content (lowercase)
+        service_name: Service name for context
+        
+    Returns:
+        PhraseDetectionResult with detection details
+    """
+    # Strategy 1: Compiled regex patterns
+    no_problems_patterns, problems_patterns = PhrasePatterns.compile_patterns()
+    
+    # Check for "NO PROBLEMS" patterns
+    for pattern in no_problems_patterns:
+        match = pattern.search(text)
+        if match:
+            logger.debug(f"   ✅ Matched NO PROBLEMS pattern: {pattern.pattern[:50]}...")
+            return PhraseDetectionResult(
+                has_no_problems=True,
+                matched_pattern=match.group(0),
+                detection_method="regex_no_problems",
+                confidence=0.95
+            )
+    
+    # Check for "PROBLEMS" patterns
+    for pattern in problems_patterns:
+        match = pattern.search(text)
+        if match:
+            logger.debug(f"   ⚠️ Matched PROBLEMS pattern: {pattern.pattern[:50]}...")
+            return PhraseDetectionResult(
+                has_no_problems=False,
+                matched_pattern=match.group(0),
+                detection_method="regex_problems",
+                confidence=0.95
+            )
+    
+    # Strategy 2: Exact phrase matching (case-insensitive)
+    exact_phrases_no_problems = [
+        f"não há problemas atuais com {service_name}",
+        f"nenhum problema atual em {service_name}",
+        f"não há problemas com {service_name}",
+        f"nenhum problema em {service_name}",
+    ]
+    
+    for phrase in exact_phrases_no_problems:
+        if phrase in text:
+            logger.debug(f"   ✅ Matched exact phrase: {phrase}")
+            return PhraseDetectionResult(
+                has_no_problems=True,
+                matched_pattern=phrase,
+                detection_method="exact_match",
+                confidence=0.90
+            )
+    
+    # Strategy 3: Keyword-based detection (fuzzy)
+    positive_keywords = ['não há problemas', 'nenhum problema', 'sem problemas', 'tudo funcionando']
+    negative_keywords = ['reportando problemas', 'fora do ar', 'indisponível', 'interrupção']
+    
+    positive_count = sum(1 for kw in positive_keywords if kw in text)
+    negative_count = sum(1 for kw in negative_keywords if kw in text)
+    
+    if positive_count > negative_count:
+        logger.debug(f"   ✅ Keyword-based: positive={positive_count}, negative={negative_count}")
+        return PhraseDetectionResult(
+            has_no_problems=True,
+            matched_pattern=f"keywords: {positive_count} positive, {negative_count} negative",
+            detection_method="keyword_fuzzy",
+            confidence=0.70
+        )
+    elif negative_count > positive_count:
+        logger.debug(f"   ⚠️ Keyword-based: positive={positive_count}, negative={negative_count}")
+        return PhraseDetectionResult(
+            has_no_problems=False,
+            matched_pattern=f"keywords: {positive_count} positive, {negative_count} negative",
+            detection_method="keyword_fuzzy",
+            confidence=0.70
+        )
+    
+    # Default: Assume problems if nothing matched
+    logger.warning(f"   ❌ No pattern matched - assuming problems")
+    return PhraseDetectionResult(
+        has_no_problems=False,
+        matched_pattern=None,
+        detection_method="no_match_default",
+        confidence=0.50
+    )
+
+
 # ============================================================================
 # DYNATRACE INTEGRATION
 # ============================================================================
@@ -190,13 +346,6 @@ class DynatraceClient:
     """Client for sending metrics to Dynatrace."""
     
     def __init__(self, url: str, api_token: str):
-        """
-        Initialize Dynatrace client.
-        
-        Args:
-            url: Dynatrace tenant URL
-            api_token: API token for authentication
-        """
         self.url = url.rstrip('/')
         self.api_token = api_token
         self.endpoint = f"{self.url}/api/v2/metrics/ingest"
@@ -208,26 +357,14 @@ class DynatraceClient:
     
     def send_metric(self, metric_name: str, value: int,
                     dimensions: Optional[Dict[str, str]] = None) -> bool:
-        """
-        Send a single metric to Dynatrace.
-        
-        Args:
-            metric_name: Name of the metric (e.g., 'custom.downdetector.pix_status')
-            value: Metric value
-            dimensions: Optional dimensions dict
-            
-        Returns:
-            True if successful, False otherwise
-        """
+        """Send a single metric to Dynatrace."""
         try:
-            # Build metric line
             if dimensions:
                 dims_str = ','.join(f"{k}={v}" for k, v in dimensions.items())
                 metric_line = f"{metric_name},{dims_str} {value}"
             else:
                 metric_line = f"{metric_name},source=downdetector {value}"
             
-            # Send to Dynatrace
             response = self.session.post(
                 self.endpoint,
                 data=metric_line.encode('utf-8'),
@@ -253,21 +390,20 @@ class DynatraceClient:
             return False
     
     def send_service_metrics(self, metrics: ServiceMetrics) -> int:
-        """
-        Send all metrics for a service.
-        
-        Args:
-            metrics: ServiceMetrics object
-            
-        Returns:
-            Number of successfully sent metrics
-        """
+        """Send all metrics for a service."""
         success_count = 0
         
         # Send feedback_problems metric
         if self.send_metric(
             f"custom.downdetector.{metrics.service_name}_feedback_problems",
             metrics.feedback_problems
+        ):
+            success_count += 1
+        
+        # Send detection confidence (NEW)
+        if metrics.detection_result and self.send_metric(
+            f"custom.downdetector.{metrics.service_name}_detection_confidence",
+            int(metrics.detection_result.confidence * 100)
         ):
             success_count += 1
         
@@ -300,24 +436,12 @@ class DowndetectorMonitor:
     """Monitor Downdetector services using Bright Data Scraping Browser."""
     
     def __init__(self, auth: str):
-        """
-        Initialize monitor.
-        
-        Args:
-            auth: Bright Data authentication string
-        """
         self.auth = auth
         self.endpoint_url = f'wss://{auth}@brd.superproxy.io:9222'
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     
     async def take_screenshot(self, page: Page, name: str) -> None:
-        """
-        Take screenshot for debugging.
-        
-        Args:
-            page: Playwright page object
-            name: Screenshot name
-        """
+        """Take screenshot for debugging."""
         try:
             path = SCREENSHOT_DIR / f"{name}_{int(time.time())}.png"
             await page.screenshot(path=str(path))
@@ -326,16 +450,7 @@ class DowndetectorMonitor:
             logger.warning(f"Failed to save screenshot {name}: {e}")
     
     async def wait_for_captcha(self, page: Page, retries: int = 2) -> bool:
-        """
-        Wait for Bright Data to solve CAPTCHA.
-        
-        Args:
-            page: Playwright page object
-            retries: Number of retry attempts
-            
-        Returns:
-            True if CAPTCHA solved, False otherwise
-        """
+        """Wait for Bright Data to solve CAPTCHA."""
         for attempt in range(retries):
             try:
                 client = await page.context.new_cdp_session(page)
@@ -351,7 +466,7 @@ class DowndetectorMonitor:
                     return True
                 
                 if attempt < retries - 1:
-                    logger.info(f"   Retrying CAPTCHA...")
+                    logger.info("   Retrying CAPTCHA...")
                     await asyncio.sleep(5)
                     
             except Exception as e:
@@ -361,18 +476,8 @@ class DowndetectorMonitor:
         
         return False
     
-    async def wait_for_content(self, page: Page, expected_phrase: str) -> bool:
-        """
-        Wait for page content to load with multiple fallback strategies.
-        
-        Args:
-            page: Playwright page object
-            expected_phrase: Expected phrase to verify content loaded
-            
-        Returns:
-            True if content loaded, False otherwise
-        """
-        # Strategy 1: Wait for load state
+    async def wait_for_content(self, page: Page) -> bool:
+        """Wait for page content to load with multiple fallback strategies."""
         try:
             await page.wait_for_load_state('load', timeout=LOAD_TIMEOUT)
             await page.wait_for_selector('body', timeout=SELECTOR_TIMEOUT)
@@ -381,57 +486,26 @@ class DowndetectorMonitor:
         except Exception as e:
             logger.debug(f"   Load state timeout: {e}")
         
-        # Strategy 2: Wait for expected phrase
-        try:
-            await page.wait_for_selector(
-                f'text={expected_phrase}',
-                timeout=SELECTOR_TIMEOUT
-            )
-            logger.debug("   ✅ Page loaded (expected phrase found)")
-            return True
-        except Exception as e:
-            logger.debug(f"   Expected phrase not found: {e}")
-        
-        # Strategy 3: Fallback sleep
         logger.warning("   ⚠️ Using fallback sleep (30s)")
         await asyncio.sleep(30)
         return True
     
     async def simulate_human_behavior(self, page: Page) -> None:
-        """
-        Simulate human-like interactions.
-        
-        Args:
-            page: Playwright page object
-        """
+        """Simulate human-like interactions."""
         try:
-            # Scroll
             await page.evaluate("window.scrollBy(0, 500)")
             await asyncio.sleep(HUMAN_SIM_DELAY)
-            
-            # Mouse movement
             await page.mouse.move(300, 400)
             await asyncio.sleep(HUMAN_SIM_DELAY)
-            
             logger.debug("   👤 Human behavior simulated")
         except Exception as e:
             logger.warning(f"   Failed to simulate human behavior: {e}")
     
     def extract_percentages(self, text: str, keywords: List[str]) -> Dict[str, int]:
-        """
-        Extract percentage values from text for given keywords.
-        
-        Args:
-            text: Page text content (already lowercase)
-            keywords: List of keywords to search for
-            
-        Returns:
-            Dict mapping normalized keywords to percentages
-        """
+        """Extract percentage values from text for given keywords."""
         percentages = {}
         
         for keyword in keywords:
-            # Create regex pattern: (\d+)%\s*keyword
             pattern = rf'(\d+)%\s*{re.escape(keyword.lower())}'
             match = re.search(pattern, text)
             
@@ -446,15 +520,7 @@ class DowndetectorMonitor:
         return percentages
     
     async def monitor_service(self, service: ServiceConfig) -> ServiceMetrics:
-        """
-        Monitor a single service.
-        
-        Args:
-            service: ServiceConfig object
-            
-        Returns:
-            ServiceMetrics object with collected data
-        """
+        """Monitor a single service."""
         start_time = time.time()
         logger.info(f"\n{'='*60}")
         logger.info(f"🔍 Monitoring: {service.name.upper()}")
@@ -463,40 +529,42 @@ class DowndetectorMonitor:
         browser: Optional[Browser] = None
         
         try:
-            # Connect to Scraping Browser
             async with async_playwright() as playwright:
                 browser = await playwright.chromium.connect_over_cdp(self.endpoint_url)
                 context = await browser.new_context()
                 page = await context.new_page()
                 
                 try:
-                    # Navigate to page
-                    logger.info(f"   Loading page...")
+                    logger.info("   Loading page...")
                     await page.goto(service.url, timeout=PAGE_TIMEOUT)
                     
-                    # Wait for CAPTCHA
                     captcha_solved = await self.wait_for_captcha(page)
                     if not captcha_solved:
-                        logger.warning(f"   ⚠️ CAPTCHA may not have been solved")
+                        logger.warning("   ⚠️ CAPTCHA may not have been solved")
                     
-                    # Wait for content
-                    await self.wait_for_content(page, service.expected_phrase)
-                    
-                    # Simulate human behavior
+                    await self.wait_for_content(page)
                     await self.simulate_human_behavior(page)
                     
                     # Extract text
                     text = await page.inner_text('body')
                     text_lower = text.lower()
                     
-                    # Check for expected phrase (feedback_problems)
-                    expected_phrase_lower = service.expected_phrase.lower()
-                    feedback_problems = 0 if expected_phrase_lower in text_lower else 1
+                    # NEW: Robust phrase detection
+                    detection_result = detect_no_problems_phrase(text_lower, service.name)
                     
-                    if feedback_problems == 0:
+                    feedback_problems = 0 if detection_result.has_no_problems else 1
+                    
+                    # Log detailed detection info
+                    if detection_result.has_no_problems:
                         logger.info(f"   ✅ No problems detected")
                     else:
-                        logger.warning(f"   ⚠️ Problems detected (expected phrase missing)")
+                        logger.warning(f"   ⚠️ Problems detected")
+                    
+                    logger.info(f"   🔍 Detection: method={detection_result.detection_method}, "
+                               f"confidence={detection_result.confidence:.0%}")
+                    
+                    if detection_result.matched_pattern:
+                        logger.debug(f"   📝 Matched: {detection_result.matched_pattern[:80]}...")
                     
                     # Extract percentages
                     percentages = self.extract_percentages(text_lower, service.percentage_keywords)
@@ -508,7 +576,8 @@ class DowndetectorMonitor:
                         feedback_problems=feedback_problems,
                         percentages=percentages,
                         processing_time=processing_time,
-                        success=True
+                        success=True,
+                        detection_result=detection_result
                     )
                     
                 except Exception as e:
@@ -518,7 +587,7 @@ class DowndetectorMonitor:
                     processing_time = time.time() - start_time
                     return ServiceMetrics(
                         service_name=service.name,
-                        feedback_problems=1,  # Assume problems on error
+                        feedback_problems=1,
                         percentages={},
                         processing_time=processing_time,
                         success=False,
@@ -553,30 +622,23 @@ class DowndetectorMonitor:
 async def main():
     """Main execution function."""
     logger.info("="*60)
-    logger.info("🚀 Downdetector Multi-Service Monitor")
+    logger.info("🚀 Downdetector Multi-Service Monitor v2.0")
     logger.info("="*60)
     
-    # Validate environment
     is_valid, errors = validate_environment()
     if not is_valid:
         logger.error("❌ Environment validation failed:")
         for error in errors:
             logger.error(f"   - {error}")
-        logger.error("\nPlease set environment variables:")
-        logger.error("   export AUTH='brd-customer-...:...'")
-        logger.error("   export DT_URL='https://....live.dynatrace.com'")
-        logger.error("   export DT_API_TOKEN='dt0c01....'")
         sys.exit(1)
     
-    logger.info(f"✅ Environment validated")
+    logger.info("✅ Environment validated")
     logger.info(f"📊 Services to monitor: {len(SERVICES)}")
     logger.info("")
     
-    # Initialize clients
     dynatrace = DynatraceClient(DT_URL, DT_API_TOKEN)
     monitor = DowndetectorMonitor(AUTH)
     
-    # Process services
     results: List[ServiceMetrics] = []
     
     try:
@@ -584,11 +646,9 @@ async def main():
             metrics = await monitor.monitor_service(service)
             results.append(metrics)
             
-            # Send to Dynatrace
             dynatrace.send_service_metrics(metrics)
             
-            # Delay between services
-            if service != SERVICES[-1]:  # Not last service
+            if service != SERVICES[-1]:
                 logger.info(f"\n⏳ Waiting {SERVICE_DELAY}s before next service...")
                 await asyncio.sleep(SERVICE_DELAY)
         
@@ -606,11 +666,16 @@ async def main():
         for result in results:
             status_emoji = "✅" if result.success else "❌"
             problem_emoji = "🔴" if result.feedback_problems == 1 else "🟢"
+            
+            confidence_str = ""
+            if result.detection_result:
+                confidence_str = f", Confidence={result.detection_result.confidence:.0%}"
+            
             logger.info(
                 f"{status_emoji} {result.service_name}: "
                 f"{problem_emoji} Problems={result.feedback_problems}, "
                 f"Metrics={len(result.percentages)}, "
-                f"Time={result.processing_time:.1f}s"
+                f"Time={result.processing_time:.1f}s{confidence_str}"
             )
         
         logger.info("="*60)
